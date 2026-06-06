@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -18,11 +19,21 @@ from docker_updater.screens import SettingsScreen, UpdateConfirmScreen
 from docker_updater.security import scan_image_security
 
 
+MAX_CONCURRENT_UPDATE_CHECKS = 32
+
+
 @dataclass(frozen=True)
 class TreeData:
     kind: str
     stack_name: Optional[str] = None
     compose_service: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ImageDigestResult:
+    image: str
+    remote_digest: Optional[str]
+    remote_error: Optional[str]
 
 
 class ComposeServicesApp(App[None]):
@@ -280,33 +291,45 @@ class ComposeServicesApp(App[None]):
 
         self.busy = True
         self.refresh_static_bars()
-        self.write_log("[bold]Checking remote image digests[/bold]")
 
-        digest_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        unique_images = self.unique_update_check_images()
 
-        for stack in self.stacks:
-            for image in stack.images:
-                if image.image is None:
-                    continue
+        if not unique_images:
+            self.busy = False
+            self.refresh_static_bars()
+            self.write_log("[yellow]No images found to check[/yellow]")
+            return
 
-                if image.image not in digest_cache:
-                    self.write_log(f"[cyan]Checking[/cyan] {escape(image.image)}")
-                    digest_cache[image.image] = await inspect_remote_digest(
-                        image=image.image,
-                        log_callback=self.log_command_line,
-                    )
+        self.write_log(
+            f"[bold]Checking remote image digests[/bold] "
+            f"[dim]({len(unique_images)} unique image(s), {MAX_CONCURRENT_UPDATE_CHECKS} concurrent checks)[/dim]"
+        )
 
-                image.remote_digest, image.remote_error = digest_cache[image.image]
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPDATE_CHECKS)
+        tasks = [
+            asyncio.create_task(self.check_single_image_digest(image=image, semaphore=semaphore))
+            for image in unique_images
+        ]
 
-                if image.remote_digest is not None and image.local_digest is not None:
-                    image.update_available = image.remote_digest != image.local_digest
-                elif image.remote_digest is not None and image.local_digest is None:
-                    image.update_available = None
-                else:
-                    image.update_available = None
+        completed = 0
 
-                self.refresh_tree()
-                self.refresh_static_bars()
+        for completed_task in asyncio.as_completed(tasks):
+            result = await completed_task
+            completed += 1
+            self.apply_digest_result(result)
+            self.refresh_tree()
+            self.refresh_static_bars()
+
+            if result.remote_error is not None:
+                self.write_log(
+                    f"[yellow]Update check failed[/yellow] "
+                    f"[dim]{escape(result.image)}: {escape(result.remote_error)}[/dim]"
+                )
+            else:
+                self.write_log(
+                    f"[green]Checked[/green] "
+                    f"[dim]{completed}/{len(unique_images)} {escape(result.image)}[/dim]"
+                )
 
         self.busy = False
         self.refresh_tree()
@@ -323,6 +346,50 @@ class ComposeServicesApp(App[None]):
             self.write_log(f"[yellow]Updates available:[/yellow] {updates}")
         else:
             self.write_log("[green]No digest updates found[/green]")
+
+    async def check_single_image_digest(
+        self,
+        image: str,
+        semaphore: asyncio.Semaphore,
+    ) -> ImageDigestResult:
+        async with semaphore:
+            self.write_log(f"[cyan]Checking[/cyan] {escape(image)}")
+            remote_digest, remote_error = await inspect_remote_digest(
+                image=image,
+                log_callback=self.log_command_line,
+            )
+
+            return ImageDigestResult(
+                image=image,
+                remote_digest=remote_digest,
+                remote_error=remote_error,
+            )
+
+    def unique_update_check_images(self) -> List[str]:
+        images = {
+            image.image
+            for stack in self.stacks
+            for image in stack.images
+            if image.image is not None
+        }
+
+        return sorted(images)
+
+    def apply_digest_result(self, result: ImageDigestResult) -> None:
+        for stack in self.stacks:
+            for image in stack.images:
+                if image.image != result.image:
+                    continue
+
+                image.remote_digest = result.remote_digest
+                image.remote_error = result.remote_error
+
+                if image.remote_digest is not None and image.local_digest is not None:
+                    image.update_available = image.remote_digest != image.local_digest
+                elif image.remote_digest is not None and image.local_digest is None:
+                    image.update_available = None
+                else:
+                    image.update_available = None
 
     async def scan_security(self) -> None:
         if self.busy:
