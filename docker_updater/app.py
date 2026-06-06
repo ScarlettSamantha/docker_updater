@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from rich.markup import escape
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, RichLog, Static, Tree
@@ -19,7 +20,7 @@ from docker_updater.screens import SettingsScreen, UpdateConfirmScreen
 from docker_updater.security import scan_image_security
 
 
-MAX_CONCURRENT_UPDATE_CHECKS = 32
+MAX_CONCURRENT_UPDATE_CHECKS = 8
 
 
 @dataclass(frozen=True)
@@ -175,23 +176,13 @@ class ComposeServicesApp(App[None]):
         self.refresh_static_bars()
         self.write_log(f"[green]Selected[/green] {len(update_names)} service stack(s) with updates")
 
+    @work
     async def action_update_selected(self) -> None:
         await self.update_selected()
 
+    @work
     async def action_settings(self) -> None:
-        if self.busy:
-            return
-
-        new_base_directory = await self.push_screen_wait(SettingsScreen(self.base_directory))
-
-        if new_base_directory is None:
-            return
-
-        self.base_directory = new_base_directory
-        self.selected_stack_names.clear()
-        self.persist_config()
-        self.write_log(f"[green]Services directory changed to[/green] {escape(str(new_base_directory))}")
-        await self.discover()
+        await self.open_settings()
 
     def action_toggle_restart(self) -> None:
         self.restart_after_update = not self.restart_after_update
@@ -248,6 +239,21 @@ class ComposeServicesApp(App[None]):
 
         self.refresh_tree()
         self.refresh_static_bars()
+
+    async def open_settings(self) -> None:
+        if self.busy:
+            return
+
+        new_base_directory = await self.push_screen_wait(SettingsScreen(self.base_directory))
+
+        if new_base_directory is None:
+            return
+
+        self.base_directory = new_base_directory
+        self.selected_stack_names.clear()
+        self.persist_config()
+        self.write_log(f"[green]Services directory changed to[/green] {escape(str(new_base_directory))}")
+        await self.discover()
 
     async def discover(self) -> None:
         if self.busy:
